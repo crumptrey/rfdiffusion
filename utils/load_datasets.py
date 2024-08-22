@@ -362,7 +362,6 @@ class DeepSig2018Dataset(Dataset):
         if self.transform:
             x = self.transform(x)
         x = torch.permute(x, [1, 0])
-        #y = self.TRAIN_MOD_TYPES[y]
         prompt = '{0} modulated signal at {1} dB SNR'.format(y,z)
         return x, prompt
 

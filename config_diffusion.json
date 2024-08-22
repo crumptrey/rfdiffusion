@@ -25,7 +25,7 @@
     "use_embedding_cfg" : true,
     "embedding_max_length" : 64,
     "embedding_features" : 768,
-    "dataset_path": "/ext/trey/experiment_diffusion/experiment_rfdiffusion/dataset/GOLD_XYZ_OSC.0001_1024.hdf5",
+    "dataset_path": "/home/trey/projectModClass/datasets/2018.01A/GOLD_XYZ_OSC.0001_1024.hdf5",
     "dataset_name": "DeepSig2018Dataset",
     "num_workers": 8,
     "save_every": 10
