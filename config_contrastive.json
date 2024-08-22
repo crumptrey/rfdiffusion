@@ -1,0 +1,23 @@
+{
+    "project_name": "contrastive_learning",
+    "base_save_dir": "/home/trey/rfdiffusion/models",
+    "learning_rate": 5e-5,
+    "epochs": 100,
+    "batch_size": 256,
+    "adam_betas": [0.9, 0.999],
+    "gamma": 0.999999,
+    "weight_decay": 1e-4,
+    "ae_in_channels": 2,
+    "ae_channels": 8,
+    "ae_multipliers": [1, 2, 4],
+    "ae_factors": [2, 2],
+    "ae_num_blocks": [2, 2],
+    "ae_patch_size": 1,
+    "ae_resnet_groups": 8,
+    "dataset_path": "/home/trey/projectModClass/datasets/2018.01A/GOLD_XYZ_OSC.0001_1024.hdf5",
+    "dataset_name": "DeepSig2018Dataset",
+    "num_workers": 8,
+    "save_every": 10,
+    "mlp_hidden_dim": 1024,
+    "mlp_projection_dim": 512
+}
