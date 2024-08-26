@@ -1,9 +1,10 @@
+#!/usr/bin/env python3
 import argparse
 import torch
 import torch.nn as nn
 from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader, random_split
-from audio_encoders_pytorch import AutoEncoder1d, TanhBottleneck
+from audio_encoders_pytorch import AutoEncoder1d, TanhBottleneck, NoiserBottleneck, STFT
 import utils.load_datasets
 import torch.nn.functional as F
 import os
@@ -17,10 +18,10 @@ from torchaudio.transforms import Spectrogram
 from sklearn.manifold import TSNE
 from sklearn.decomposition import PCA
 import seaborn as sns
-from transformers import BertModel, BertTokenizer, RobertaModel, RobertaTokenizer
-import torch.nn.functional as F
-import wandb
 
+
+os.environ["WANDB_AGENT_DISABLE_FLAPPING"] = "true"
+import wandb
 def plot_latent_space(latent_representations, labels, idx=0, save_dir="plots", save_name="latent_space"):
     """
     Plot the latent space of the encoded signals using different methods.
@@ -150,7 +151,7 @@ def compute_spectrogram_loss(input_signal, decoded_signal):
 
 
 def setup_dataloader(config, val_split=0.2):
-    dataset = utils.load_datasets.DeepSig2018Dataset(config["dataset_path"])
+    dataset = utils.load_datasets.DeepSig2018Dataset_MOD(config["dataset_path"])
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
@@ -161,83 +162,38 @@ def setup_dataloader(config, val_split=0.2):
 
     return train_loader, val_loader
 
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        return x
-
-class ContrastiveModel(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.signal_encoder = AutoEncoder1d(
-            in_channels=config['ae_in_channels'],
-            channels=config['ae_channels'],
-            multipliers=config['ae_multipliers'],
-            factors=config['ae_factors'],
-            num_blocks=config['ae_num_blocks'],
-            patch_size=config['ae_patch_size'],
-            resnet_groups=config['ae_resnet_groups'],
-            bottleneck=TanhBottleneck()
-        )
-        self.text_encoder = RobertaModel.from_pretrained('roberta-base')
-        self.text_projection_head = MLP(768, config['mlp_hidden_dim'], config['mlp_projection_dim'])
-        self.signal_projection_head = MLP(32 * 256, config['mlp_hidden_dim'], config['mlp_projection_dim'])
-        #self.text_projection_head = nn.Linear(768, config['mlp_projection_dim'])
-        #self.signal_projection_head = nn.Linear(32 * 256,  config['mlp_projection_dim'])
-    def forward(self, signal, text):
-        signal_embedding = self.signal_encoder.encode(signal)
-        # Reshape and project signal embedding
-        signal_embedding = signal_embedding.view(signal_embedding.size(0), -1)  # Shape: [512, 8192]
-        signal_embedding = self.signal_projection_head(signal_embedding)  # Shape: [512, 768]
-
-        text_outputs = self.text_encoder(**text)
-        text_embedding = self.text_projection_head(text_outputs.last_hidden_state[:, 0, :])
-        return signal_embedding, text_embedding
-
-
-class ContrastiveLossWithLearnableTemp(nn.Module):
-    def __init__(self, initial_temperature=0.07):
-        super(ContrastiveLossWithLearnableTemp, self).__init__()
-        # Initialize the temperature parameter
-        self.temperature = nn.Parameter(torch.tensor(initial_temperature, dtype=torch.float32))
-
-    def forward(self, embedding_x, embedding_y):
-        # Normalize embeddings
-        embedding_x = F.normalize(embedding_x, dim=1)
-        embedding_y = F.normalize(embedding_y, dim=1)
-
-        # Compute similarity logits
-        similarity_x_y = torch.matmul(embedding_x, embedding_y.t()) / self.temperature
-        similarity_y_x = torch.matmul(embedding_y, embedding_x.t()) / self.temperature
-
-        # Create labels
-        labels = torch.arange(similarity_x_y.size(0), device=similarity_x_y.device)
-
-        # Compute loss components
-        loss_x_y = F.cross_entropy(similarity_x_y, labels, reduction='mean')
-        loss_y_x = F.cross_entropy(similarity_y_x, labels, reduction='mean')
-
-        # Compute symmetric loss
-        loss = (loss_x_y + loss_y_x) / 2
-
-        return loss
-
 def setup_model(config):
-    return ContrastiveModel(config)
+    if config['ae_bottleneck'] == 0:
+        bottleneck = [TanhBottleneck()]
+    elif config['ae_bottleneck'] == 1:
+        bottleneck = [TanhBottleneck(), NoiserBottleneck(config['ae_sigma'])]
+    elif config['ae_bottleneck'] == 2:
+        bottleneck = [NoiserBottleneck(config['ae_sigma']), TanhBottleneck()]
+    ae = AutoEncoder1d(
+        in_channels=config['ae_in_channels'],
+        channels=config['ae_channels'],
+        multipliers=config['ae_multipliers'],
+        factors=config['ae_factors'],
+        num_blocks=config['ae_num_blocks'],
+        patch_size=config['ae_patch_size'],
+        resnet_groups=config['ae_resnet_groups'],
+        bottleneck=bottleneck
+    )
+    if config['tf_rep'] == 0:
+        rep = STFT(
+            num_fft = config["stft_num_fft"],
+            hop_length = config["stft_hop_length"],
+            window_length = config["stft_window_length"],
+            length = config["stft_length"]
+        )
+    return ae, rep
+
 
 
 def setup_training(config, model):
     optimizer = AdamW(model.parameters(), lr=config['learning_rate'], betas=tuple(config['adam_betas']), weight_decay=config['weight_decay'])
     scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, config['gamma'])
-    criterion = ContrastiveLossWithLearnableTemp(initial_temperature=0.07)
+    criterion = nn.MSELoss()
     return optimizer, criterion, scheduler
 
 def setup_accelerator(config):
@@ -250,85 +206,62 @@ def setup_accelerator(config):
     )
     return accelerator, run_name
 
-def cosine_similarity(signal_embed, text_embed, batch_size=32):
-    similarity_matrix = []
-
-    for i in range(0, signal_embed.size(0), batch_size):
-        signal_batch = signal_embed[i:i+batch_size]
-        text_batch = text_embed[i:i+batch_size]
-        if signal_batch.size(0) < batch_size:
-            continue
-        similarity_matrix.append(F.cosine_similarity(signal_batch.unsqueeze(1), text_batch.unsqueeze(0), dim=-1))
-
-    return torch.cat(similarity_matrix, dim=0)
-
-
-def mean_reciprocal_rank(similarity_matrix):
-    # Get the rank of the correct match (i.e., the diagonal elements)
-    ranks = torch.argsort(torch.argsort(similarity_matrix, dim=1, descending=True), dim=1, descending=False)
-    correct_ranks = torch.diag(ranks)
-
-    # Compute the reciprocal of the ranks and take the mean
-    reciprocal_ranks = 1.0 / (correct_ranks.float() + 1.0)
-    return reciprocal_ranks.mean().item()
-
-def top_k_accuracy(similarity_matrix, k=1):
-    # Get the indices of the top-k matches
-    top_k_matches = torch.topk(similarity_matrix, k=k, dim=1).indices
-    # Check if the correct match (i.e., diagonal index) is within the top-k matches
-    correct_matches = torch.arange(similarity_matrix.size(0)).unsqueeze(1).to(similarity_matrix.device)
-    correct_in_top_k = (top_k_matches == correct_matches).any(dim=1)
-    return correct_in_top_k.float().mean().item()
-
-def evaluate_model(model, criterion, data_loader, accelerator, tokenizer):
+def evaluate_model(model, rep, data_loader, accelerator):
     model.eval()
-    total_loss = 0.0
+    total_time_loss = 0.0
+    total_spectrogram_loss = 0.0
     num_samples = 0
-    signal_embeddings = []
-    text_embeddings = []
+
+    # To collect all latent representations
+    all_latent_representations = []
+    all_labels = []
+
+    # Get the underlying model if it's wrapped in DistributedDataParallel
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model = model.module
 
     with torch.no_grad():
-        for batch_idx, (signals, prompts) in enumerate(data_loader):
-            signals = signals.to(accelerator.device)
-            text_inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt").to(accelerator.device)
+        for batch_idx, (x, labels) in enumerate(data_loader):
+            x_time = x.to(accelerator.device)
+            x_freq = rep.encode(x_time)
+            y = model.encode(x_freq)
+            y_decoded_freq = model.decode(y)
+            y_decoded_time = rep.decode(y_decoded_freq)
+            # labels = labels.to(accelerator.device)  # Assuming labels are provided
 
-            signal_embed, text_embed = model(signals, text_inputs)
-            loss = criterion(signal_embed, text_embed)
+            # Time-domain reconstruction loss
+            time_loss = F.mse_loss(y_decoded_time, x_time)
+            total_time_loss += time_loss.item() * x.size(0)
 
-            total_loss += loss.item() * signals.size(0)
-            num_samples += signals.size(0)
-            # Store embeddings for metrics calculation
-            signal_embeddings.append(signal_embed)
-            text_embeddings.append(text_embed)
+            # Spectrogram-based reconstruction loss
+            spectrogram_loss = F.mse_loss(y_decoded_freq, x_freq)
+            total_spectrogram_loss += spectrogram_loss.item() * x.size(0)
+            all_labels.extend(labels)
+            num_samples += x.size(0)
+            # Collect latent representations for visualization
+            all_latent_representations.append(y.cpu())
+            # Visualize the first 5 pairs in the batch
+            if batch_idx < 3:
+                for i in range(min(len(x), 1)):
+                    plot_waveform_and_spectrogram(x[i], y_decoded_time[i], i)
 
-    # Concatenate all embeddings
-    signal_embeddings = torch.cat(signal_embeddings, dim=0)
-    text_embeddings = torch.cat(text_embeddings, dim=0)
-    # Calculate similarity matrix
-    similarity_matrix = cosine_similarity(signal_embeddings, text_embeddings)
-
-    # Calculate metrics
-    avg_loss = total_loss / num_samples
-    avg_cosine_similarity = torch.mean(torch.diag(similarity_matrix)).item()
-    mrr = mean_reciprocal_rank(similarity_matrix)
-    top_1_accuracy = top_k_accuracy(similarity_matrix, k=1)
-    top_30_accuracy = top_k_accuracy(similarity_matrix, k=30)
-
-    # Log metrics
+    avg_time_loss = total_time_loss / num_samples
+    avg_spectrogram_loss = total_spectrogram_loss / num_samples
+    # Concatenate all latent representations into a single tensor
+    all_latent_representations = torch.cat(all_latent_representations, dim=0)
+    plot_latent_space(all_latent_representations, all_labels)
+    # Log the losses to wandb
     accelerator.log({
-        "eval_loss": avg_loss,
-        "avg_cosine_similarity": avg_cosine_similarity,
-        "mean_reciprocal_rank": mrr,
-        "top_1_accuracy": top_1_accuracy,
-        "top_30_accuracy": top_30_accuracy,
+        "eval_loss": avg_time_loss,
+        "eval_spectrogram_loss": avg_spectrogram_loss
     })
 
-    return avg_loss
+    return avg_time_loss, avg_spectrogram_loss
 
 
-def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader, accelerator, config, tokenizer):
-    model, optimizer,criterion, train_loader, val_loader, scheduler = accelerator.prepare(
-        model, optimizer, criterion, train_loader, val_loader, scheduler
+def train_model(model, rep, optimizer, criterion, scheduler, train_loader, val_loader, accelerator, config):
+    model, rep, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, rep, optimizer, train_loader, val_loader, scheduler
     )
     num_training_steps = config['epochs'] * len(train_loader)
     progress_bar = tqdm(range(num_training_steps), disable=not accelerator.is_local_main_process)
@@ -338,25 +271,26 @@ def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader
     best_val_loss = float('inf')
     patience = 0
     early_stopping_patience = config['early_stopping_patience']
-    for epoch in range(config['epochs']):
-        for signals, labels in train_loader:
-            text_inputs = tokenizer(labels, padding=True, truncation=True, return_tensors="pt").to(accelerator.device)
 
-            signal_embed, text_embed = model(signals, text_inputs)
-            loss = criterion(signal_embed, text_embed)
+    for epoch in range(config['epochs']):
+        for x, _ in train_loader:
+            x_enc = rep.encode(x)
+            y = model(x_enc)
+            loss = criterion(y, x_enc)
 
             accelerator.backward(loss)
             optimizer.step()
-            #scheduler.step()
+            scheduler.step()
             optimizer.zero_grad()
 
             progress_bar.update(1)
 
             accelerator.log({"training_loss": loss, "learning_rate": scheduler.get_last_lr()[0]}, step=step)
             step += 1
+        eval_loss, freq_loss = evaluate_model(model, rep, val_loader, accelerator)
+        if epoch % config['save_every'] == 0 and accelerator.is_main_process:
+            save_checkpoint(model, optimizer, epoch, config['model_save_dir'], f'model_epoch_{epoch}.pth')
 
-        eval_loss = evaluate_model(model, criterion, val_loader, accelerator, tokenizer)
-        accelerator.log({"val_loss": eval_loss}, step=step)
         if eval_loss < best_val_loss:
             best_val_loss = eval_loss
             patience = 0
@@ -380,23 +314,25 @@ def save_checkpoint(model, optimizer, epoch, save_dir, filename):
 
 def main():
     # Load the sweep configuration
-    sweep_config = json.load(open('sweep_config.json'))
+    sweep_config = json.load(open('autoencoder_sweep.json'))
 
     # Load the fixed parameters from the separate JSON file
-    with open('config_fixed.json', 'r') as f:
+    with open('autoencoder_sweep_fixed.json', 'r') as f:
         fixed_params = json.load(f)
 
     # Initialize the wandb sweep
-    wandb.init(project=fixed_params["project_name"], config={**sweep_config["parameters"], **fixed_params})
+    print(f"Initializing wandb with project name: {fixed_params['project_name']}")
+    # Initialize the wandb sweep
+    wandb.init(config={**sweep_config["parameters"], **fixed_params})
     config = wandb.config
 
     # Construct model_save_dir
     config['model_save_dir'] = os.path.join(config['base_save_dir'], config['project_name'])
     os.makedirs(config['model_save_dir'], exist_ok=True)
-    tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
+    # Choose tokenizer based on the text encoder type
     accelerator, run_name = setup_accelerator(config)
 
-    model = setup_model(config)
+    model, rep = setup_model(config)
     optimizer, criterion, scheduler = setup_training(config, model)
     train_loader, val_loader = setup_dataloader(config)
 
@@ -404,7 +340,7 @@ def main():
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     print(f"Models will be saved in: {config['model_save_dir']}")
 
-    train_model(model, optimizer, criterion, scheduler, train_loader, val_loader, accelerator, config, tokenizer)
+    train_model(model, rep, optimizer, criterion, scheduler, train_loader, val_loader, accelerator, config)
 
     if accelerator.is_main_process:
         final_checkpoint_path = os.path.join(config['model_save_dir'], f'model_{run_name}.pth')
