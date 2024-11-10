@@ -22,14 +22,9 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 import utils.load_datasets
-import utils.training
-import utils.logging
-from networks import *
-import networks.transforms as net_transforms
 from torchvision import transforms
 import numpy as np
-
-from utils import *
+import wandb 
 
 # constants
 
@@ -806,16 +801,33 @@ class Trainer1D(object):
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        project_name = 'rfdiffusion_nolatent',
+        run_name = None
     ):
         super().__init__()
-
-        # accelerator
-
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
         )
+        # Initialize wandb
+        if self.accelerator.is_main_process:
+            self.wandb_run = wandb.init(project=project_name, name=run_name, config={
+                "train_batch_size": train_batch_size,
+                "gradient_accumulate_every": gradient_accumulate_every,
+                "train_lr": train_lr,
+                "train_num_steps": train_num_steps,
+                "ema_update_every": ema_update_every,
+                "ema_decay": ema_decay,
+                "adam_betas": adam_betas,
+                "save_and_sample_every": save_and_sample_every,
+                "num_samples": num_samples,
+                "amp": amp,
+                "mixed_precision_type": mixed_precision_type,
+                "max_grad_norm": max_grad_norm
+            })
+        # accelerator
+
 
         # model
 
@@ -937,6 +949,13 @@ class Trainer1D(object):
                 self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
+                                        # Log metrics to wandb
+                    wandb.log({
+                        "loss": total_loss,
+                        "step": self.step,
+                        "learning_rate": self.opt.param_groups[0]['lr']
+                    })
+
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
@@ -956,16 +975,17 @@ class Trainer1D(object):
         accelerator.print('training complete')
 
 if __name__ == '__main__':
-    num_classes = 10
-    sequence_len = 128
-    timestep = 1000
-    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                         'BPSK']
+    sequence_len = 1024
+    timestep = 5
+
+    train_modulations = ['OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK', '16APSK', '32APSK',
+                        '64APSK', '128APSK', '16QAM', '32QAM', '64QAM', '128QAM', '256QAM', 'AM-SSB-WC',
+                        'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC', 'FM', 'GMSK', 'OQPSK']
     model = Unet1D(
-        dim = 128,
-        num_classes= len(train_modulations),
+        dim = 64,
         channels = 2,
-        dim_mults = (1, 2, 4, 8)
+        dim_mults = (1, 2, 4, 8),
+        num_classes= len(train_modulations)
     )
 
     diffusion = GaussianDiffusion1D(
@@ -973,33 +993,14 @@ if __name__ == '__main__':
         seq_length = sequence_len,
         timesteps = timestep
     ).cuda()
+    dataset_path = "/ext/trey/experiment_diffusion/experiment_rfdiffusion/dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
+    train_dataset = utils.load_datasets.DeepSig2018Dataset_MOD(dataset_path)
 
-    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                               'BPSK']
-    train_SNRs = np.arange(-20, 19, 2)
-    test_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                               'BPSK']
-    test_SNRs = np.arange(-20, 19, 2)
-    dataset_train_name = '2016.10A'
-    dataset_test_name = '2016.10A'
-    dataDir = '/home/trey/experiment_rfdiffusion/models/test/'
-    utils.training.create_directory(dataDir)
-    split = [0.75, 0.05, 0.20]
-    train_transforms = transforms.Compose([
-        net_transforms.PowerNormalization(),
-    ])
-    test_transforms = train_transforms
-    train_dataset, valid_dataset, test_dataset = utils.load_datasets.getDataset(dataset_train_name, dataset_test_name,
-                                                                                train_modulations, train_SNRs,
-                                                                                test_modulations, test_SNRs, split,
-                                                                                dataDir, train_transforms, test_transforms)
     
     trainer = Trainer1D(
         diffusion,
         train_dataset,
-        train_num_steps = 10000,         # total training steps
+        train_num_steps = 100000,         # total training steps
     )
 
     trainer.train()
-
-

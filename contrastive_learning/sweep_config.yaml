@@ -1,0 +1,24 @@
+program: "CLAP_Sweep.py"
+method: "bayes"
+metric:
+  name: "eval_loss"
+  goal: "minimize"
+
+parameters:
+  batch_size:
+    values: [128, 256, 512]
+  text_mlp_hidden_dim:
+    values: [ 64, 128, 256, 512, 1024 ]
+  signal_mlp_hidden_dim:
+    values: [64, 128, 256, 512, 1024]
+  mlp_projection_dim:
+    values: [128, 256, 512, 768, 1024]
+  learning_rate:
+    min: 0.000001
+    max: 0.1
+  weight_decay:
+    values: [0.0, 1e-4, 1e-3]
+  text_encoder_type:
+    values:
+      - "bert"
+      - "roberta"

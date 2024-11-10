@@ -4,14 +4,13 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam, AdamW
 from torch.utils.data import DataLoader, random_split
-from audio_encoders_pytorch import AutoEncoder1d, TanhBottleneck
+from audio_encoders_pytorch import AutoEncoder1d, TanhBottleneck, NoiserBottleneck
 import utils.load_datasets
 import torch.nn.functional as F
 import os
 from tqdm import tqdm
 from accelerate import Accelerator
 import random
-import json
 import matplotlib.pyplot as plt
 import numpy as np
 from torchaudio.transforms import Spectrogram
@@ -20,6 +19,9 @@ from sklearn.decomposition import PCA
 import seaborn as sns
 from transformers import BertModel, BertTokenizer, RobertaModel, RobertaTokenizer
 import wandb
+import yaml
+from typing import Dict, Any
+from accelerate import DistributedDataParallelKwargs
 
 def plot_latent_space(latent_representations, labels, idx=0, save_dir="plots", save_name="latent_space"):
     """
@@ -68,6 +70,7 @@ def plot_latent_space(latent_representations, labels, idx=0, save_dir="plots", s
 
     # Plot configurations
     fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
     # Function to create scatter plot with unique colors
     def scatter_with_legend(ax, x, y, labels, title):
         for label in unique_labels:
@@ -150,16 +153,18 @@ def compute_spectrogram_loss(input_signal, decoded_signal):
 
 
 def setup_dataloader(config, val_split=0.2):
-    dataset = utils.load_datasets.DeepSig2018Dataset(config["dataset_path"])
+    dataset = utils.load_datasets.DeepSig2018Dataset(config.dataset_path)
     val_size = int(len(dataset) * val_split)
     train_size = len(dataset) - val_size
     train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
 
-    train_loader = DataLoader(train_dataset, batch_size=config["batch_size"], shuffle=True, pin_memory=True,
-                              num_workers=config["num_workers"])
-    val_loader = DataLoader(val_dataset, batch_size=config["batch_size"], shuffle=False, pin_memory=True, num_workers=config["num_workers"])
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, pin_memory=True,
+                              num_workers=config.num_workers)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, shuffle=False, pin_memory=True,
+                            num_workers=config.num_workers)
 
     return train_loader, val_loader
+
 
 class MLP(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -174,39 +179,52 @@ class MLP(nn.Module):
         x = self.fc2(x)
         return x
 
+
 class ContrastiveModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.signal_encoder = AutoEncoder1d(
-            in_channels=config['ae_in_channels'],
-            channels=config['ae_channels'],
-            multipliers=config['ae_multipliers'],
-            factors=config['ae_factors'],
-            num_blocks=config['ae_num_blocks'],
-            patch_size=config['ae_patch_size'],
-            resnet_groups=config['ae_resnet_groups'],
-            bottleneck=TanhBottleneck()
+        if config.ae_bottleneck == 0:
+            bottleneck = [TanhBottleneck()]
+        elif config.ae_bottleneck == 1:
+            bottleneck = [TanhBottleneck(), NoiserBottleneck(config.ae_sigma)]
+        elif config.ae_bottleneck == 2:
+            bottleneck = [NoiserBottleneck(config.ae_sigma), TanhBottleneck()]
+        signal_encoder = AutoEncoder1d(
+            in_channels=config.ae_in_channels,
+            channels=config.ae_channels,
+            multipliers=config.ae_multipliers,
+            factors=config.ae_factors,
+            num_blocks=config.ae_num_blocks,
+            patch_size=config.ae_patch_size,
+            resnet_groups=config.ae_resnet_groups,
+            bottleneck=bottleneck
         )
         # Choose between BERT and RoBERTa
-        if config['text_encoder_type'] == 'bert':
-            self.text_encoder = BertModel.from_pretrained('bert-base-uncased')
-        elif config['text_encoder_type'] == 'roberta':
-            self.text_encoder = RobertaModel.from_pretrained('roberta-base')
+        if config.text_encoder_type == 'bert':
+            text_encoder = BertModel.from_pretrained('bert-base-uncased')
+        elif config.text_encoder_type == 'roberta':
+            text_encoder = RobertaModel.from_pretrained('roberta-base')
         else:
             raise ValueError("Invalid text_encoder_type. Choose 'bert' or 'roberta'.")
-        self.text_projection_head = MLP(768, config['text_mlp_hidden_dim'], config['mlp_projection_dim'])
-        self.signal_projection_head = MLP(32 * 256, config['signal_mlp_hidden_dim'], config['mlp_projection_dim'])
 
-    def forward(self, signal, text):
-        signal_embedding = self.signal_encoder.encode(signal)
-        # Reshape and project signal embedding
-        signal_embedding = signal_embedding.view(signal_embedding.size(0), -1)  # Shape: [512, 8192]
-        signal_embedding = self.signal_projection_head(signal_embedding)  # Shape: [512, 768]
 
-        text_outputs = self.text_encoder(**text)
-        text_embedding = self.text_projection_head(text_outputs.last_hidden_state[:, 0, :])
-        return signal_embedding, text_embedding
+        signal_proj = MLP(64*256, config.signal_mlp_hidden_dim, config.mlp_projection_dim)
+        text_proj = MLP(768, config.text_mlp_hidden_dim, config.mlp_projection_dim)
+        self.signal_encoder = signal_encoder
+        self.text_encoder = text_encoder
+        self.text_proj = text_proj
+        self.signal_proj = signal_proj
 
+    def forward(self, text_input_ids, text_attention_mask, signal_input):
+        signal_latent = self.signal_encoder.encode(signal_input)
+        signal_latent = signal_latent.view(signal_latent.size(0), -1)
+        signal_latent = self.signal_proj(signal_latent)
+
+        text_latent = self.text_encoder(input_ids=text_input_ids, attention_mask=text_attention_mask).last_hidden_state
+        text_latent = text_latent[:, 0, :]  # Take CLS token
+        text_latent = self.text_proj(text_latent)
+
+        return signal_latent, text_latent
 
 class ContrastiveLossWithLearnableTemp(nn.Module):
     def __init__(self, initial_temperature=0.07):
@@ -238,14 +256,30 @@ class ContrastiveLossWithLearnableTemp(nn.Module):
 def setup_model(config):
     return ContrastiveModel(config)
 
-
-def setup_training(config, model):
-    optimizer = AdamW(model.parameters(), lr=config['learning_rate'], betas=tuple(config['adam_betas']), weight_decay=config['weight_decay'])
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, config['gamma'])
-    criterion = ContrastiveLossWithLearnableTemp(initial_temperature=0.07)
-    return optimizer, criterion, scheduler
-
 def setup_accelerator(config):
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], log_with="wandb")
+    run_name = str(random.randint(0, 10e5))
+    accelerator.init_trackers(
+        config['project_name'],
+        config=config,
+        init_kwargs={"wandb": {"name": run_name}}
+    )
+    return accelerator, run_name
+
+
+def train_model(model, ae, optimizer, data_loader, accelerator, config):
+    model, ae, optimizer, data_loader = accelerator.prepare(
+        model, ae, optimizer, data_loader
+    )
+
+    num_training_steps = config['epochs'] * len(data_loader)
+    progress_bar = tqdm(range(num_training_steps), disable=not accelerator.is_local_main_process)
+
+    model.train()
+    ae.eval()
+
+
     accelerator = Accelerator(log_with="wandb")
     run_name = str(random.randint(0, 10e5))
     accelerator.init_trackers(
@@ -254,6 +288,12 @@ def setup_accelerator(config):
         init_kwargs={"wandb": {"name": run_name}}
     )
     return accelerator, run_name
+
+def setup_training(config, model):
+    optimizer = AdamW(model.parameters(), lr=config['learning_rate'], betas=tuple(config['adam_betas']), weight_decay=config['weight_decay'])
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, config['gamma'])
+    criterion = ContrastiveLossWithLearnableTemp(initial_temperature=0.07)
+    return optimizer, criterion, scheduler
 
 def cosine_similarity(signal_embed, text_embed, batch_size=32):
     similarity_matrix = []
@@ -353,7 +393,7 @@ def evaluate_model(model, criterion, data_loader, accelerator, tokenizer):
             signals = signals.to(accelerator.device)
             text_inputs = tokenizer(prompts, padding=True, truncation=True, return_tensors="pt").to(accelerator.device)
 
-            signal_embed, text_embed = model(signals, text_inputs)
+            signal_embed, text_embed = model(text_inputs['input_ids'], text_inputs['attention_mask'], signals)
             loss = criterion(signal_embed, text_embed)
 
             total_loss += loss.item() * signals.size(0)
@@ -394,24 +434,23 @@ def evaluate_model(model, criterion, data_loader, accelerator, tokenizer):
 
     return avg_loss
 
-
 def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader, accelerator, config, tokenizer):
     model, optimizer,criterion, train_loader, val_loader, scheduler = accelerator.prepare(
         model, optimizer, criterion, train_loader, val_loader, scheduler
     )
-    num_training_steps = config['epochs'] * len(train_loader)
+    num_training_steps = config.epochs * len(train_loader)
     progress_bar = tqdm(range(num_training_steps), disable=not accelerator.is_local_main_process)
 
     model.train()
     step = 1
     best_val_loss = float('inf')
     patience = 0
-    early_stopping_patience = config['early_stopping_patience']
-    for epoch in range(config['epochs']):
+    early_stopping_patience = config.early_stopping_patience
+    for epoch in range(config.epochs):
         for signals, labels in train_loader:
             text_inputs = tokenizer(labels, padding=True, truncation=True, return_tensors="pt").to(accelerator.device)
 
-            signal_embed, text_embed = model(signals, text_inputs)
+            signal_embed, text_embed = model(text_inputs['input_ids'], text_inputs['attention_mask'], signals)
             loss = criterion(signal_embed, text_embed)
 
             accelerator.backward(loss)
@@ -428,14 +467,14 @@ def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader
             best_val_loss = eval_loss
             patience = 0
             if accelerator.is_main_process:
-                save_checkpoint(model, optimizer, epoch, config['model_save_dir'], f'model_epoch_{epoch}.pth')
+                save_checkpoint(model, optimizer, epoch, config.model_save_dir, f'model_epoch_{epoch}.pth')
         else:
             patience += 1
             if patience >= early_stopping_patience:
                 print(f"Early stopping triggered at epoch {epoch}")
                 break
         if epoch % config['save_every'] == 0 and accelerator.is_main_process:
-            save_checkpoint(model, optimizer, epoch, config['model_save_dir'], f'model_epoch_{epoch}.pth')
+            save_checkpoint(model, optimizer, epoch, config.model_save_dir, f'model_epoch_{epoch}.pth')
 
     accelerator.end_training()
 
@@ -445,30 +484,39 @@ def save_checkpoint(model, optimizer, epoch, save_dir, filename):
     torch.save(model, checkpoint_path)
 
 
+def load_fixed_config(path: str) -> Dict[str, Any]:
+    with open(path, 'r') as file:
+        return yaml.safe_load(file)
+
+
+def setup_wandb(fixed_config: Dict[str, Any]) -> None:
+    wandb.init(config=fixed_config)
+    # Merge fixed config with sweep config
+    wandb.config.update(fixed_config, allow_val_change=True)
+
+
 def main():
-    # Load the sweep configuration
-    sweep_config = json.load(open('sweep_config.json'))
+    # Load fixed configuration
+    fixed_config = load_fixed_config('config_contrastive.yaml')
 
-    # Load the fixed parameters from the separate JSON file
-    with open('config_fixed.json', 'r') as f:
-        fixed_params = json.load(f)
+    # Setup wandb
+    setup_wandb(fixed_config)
 
-    # Initialize the wandb sweep
-    print(f"Initializing wandb with project name: {fixed_params['project_name']}")
-    # Initialize the wandb sweep
-    wandb.init(config={**sweep_config["parameters"], **fixed_params})
+    # Access the merged configuration
     config = wandb.config
 
     # Construct model_save_dir
-    config['model_save_dir'] = os.path.join(config['base_save_dir'], config['project_name'])
-    os.makedirs(config['model_save_dir'], exist_ok=True)
+    config.model_save_dir = os.path.join(config.base_save_dir, config.project_name)
+    os.makedirs(config.model_save_dir, exist_ok=True)
+
     # Choose tokenizer based on the text encoder type
-    if config['text_encoder_type'] == 'bert':
+    if config.text_encoder_type == 'bert':
         tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-    elif config['text_encoder_type'] == 'roberta':
+    elif config.text_encoder_type == 'roberta':
         tokenizer = RobertaTokenizer.from_pretrained('roberta-base')
     else:
         raise ValueError("Invalid text_encoder_type. Choose 'bert' or 'roberta'.")
+
     accelerator, run_name = setup_accelerator(config)
 
     model = setup_model(config)
@@ -477,17 +525,16 @@ def main():
 
     print(f"Training on {accelerator.num_processes} GPUs")
     print(f"Number of parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
-    print(f"Models will be saved in: {config['model_save_dir']}")
+    print(f"Models will be saved in: {config.model_save_dir}")
 
     train_model(model, optimizer, criterion, scheduler, train_loader, val_loader, accelerator, config, tokenizer)
 
     if accelerator.is_main_process:
-        final_checkpoint_path = os.path.join(config['model_save_dir'], f'model_{run_name}.pth')
-        save_checkpoint(accelerator.unwrap_model(model), optimizer, config['epochs'], config['model_save_dir'],
+        final_checkpoint_path = os.path.join(config.model_save_dir, f'model_{run_name}.pth')
+        save_checkpoint(accelerator.unwrap_model(model), optimizer, config.epochs, config.model_save_dir,
                         final_checkpoint_path)
 
     print("Training complete and models saved.")
-
 
 
 if __name__ == "__main__":

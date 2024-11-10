@@ -22,18 +22,14 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 import utils.load_datasets
-import utils.training
-import utils.logging
-from networks import *
-import networks.transforms as net_transforms
 from torchvision import transforms
 import numpy as np
 from typing import Any, Callable, Optional, Sequence, Type, TypeVar, Union
-from utils import *
 import os
 from transformers import AutoTokenizer, T5EncoderModel
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # constants
+import wandb
 
 ModelPrediction =  namedtuple('ModelPrediction', ['pred_noise', 'pred_x_start'])
 
@@ -817,11 +813,13 @@ class Trainer1D(object):
         adam_betas = (0.9, 0.99),
         save_and_sample_every = 10000,
         num_samples = 64,
-        results_folder = './results_prompt',
+        results_folder = '/ext/trey/experiment_diffusion/experiment_rfdiffusion/models',
         amp = False,
         mixed_precision_type = 'fp16',
         split_batches = True,
-        max_grad_norm = 1.
+        max_grad_norm = 1.,
+        project_name = 'rfdiffusion_nonlatent',
+        run_name = None
     ):
         super().__init__()
 
@@ -875,7 +873,22 @@ class Trainer1D(object):
 
         # prepare model, dataloader, optimizer with accelerator
 
-        self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
+        if self.accelerator.is_main_process:
+            self.wandb_run = wandb.init(project=project_name, name=run_name, config={
+                "train_batch_size": train_batch_size,
+                "gradient_accumulate_every": gradient_accumulate_every,
+                "train_lr": train_lr,
+                "train_num_steps": train_num_steps,
+                "ema_update_every": ema_update_every,
+                "ema_decay": ema_decay,
+                "adam_betas": adam_betas,
+                "save_and_sample_every": save_and_sample_every,
+                "num_samples": num_samples,
+                "amp": amp,
+                "mixed_precision_type": mixed_precision_type,
+                "max_grad_norm": max_grad_norm
+            })      
+            self.model, self.opt = self.accelerator.prepare(self.model, self.opt)
 
     @property
     def device(self):
@@ -927,21 +940,10 @@ class Trainer1D(object):
                 total_loss = 0.
 
                 for _ in range(self.gradient_accumulate_every):
-                    x, mod_class, snr = next(self.dl)
+                    x, prompt = next(self.dl)
                     x = x.to(device)
-                    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64',
-                                         'AM-DSB',
-                                         'BPSK']
-                    train_SNRs = np.arange(-20, 19, 2)
-                    prompts = []
-
-                    for i in range(x.size()[0]):
-                        modulation = train_modulations[mod_class[i].item()]
-                        snr_value = train_SNRs[snr[i].item()]
-                        prompt = f"{modulation} modulated waveform at {snr_value} dB SNR"
-                        prompts.append(prompt)
                     with self.accelerator.autocast():
-                        loss = self.model(x, text=prompts)
+                        loss = self.model(x, text=prompt)
                         loss = loss / self.gradient_accumulate_every
                         total_loss += loss.item()
 
@@ -960,6 +962,11 @@ class Trainer1D(object):
                 self.step += 1
                 if accelerator.is_main_process:
                     self.ema.update()
+                    wandb.log({
+                        "loss": total_loss,
+                        "step": self.step,
+                        "learning_rate": self.opt.param_groups[0]['lr']
+                    })
 
                     if self.step != 0 and self.step % self.save_and_sample_every == 0:
                         self.ema.ema_model.eval()
@@ -973,17 +980,18 @@ class Trainer1D(object):
 
                         torch.save(all_samples, str(self.results_folder / f'sample-{milestone}.png'))
                         self.save(milestone)
+                        wandb.log({
+                            "samples": wandb.Image(sample_path),
+                            "step": self.step
+                        })
 
                 pbar.update(1)
 
         accelerator.print('training complete')
 
 if __name__ == '__main__':
-    sequence_len = 128
+    sequence_len = 1024
     timestep = 5
-    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                         'BPSK']
-    train_SNRs = np.arange(-20, 19, 2)
     model = Unet1D(
         dim = 64,
         channels = 2,
@@ -995,26 +1003,9 @@ if __name__ == '__main__':
         seq_length = sequence_len,
         timesteps = timestep
     ).cuda()
+    dataset_path = "/ext/trey/experiment_diffusion/experiment_rfdiffusion/dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
+    train_dataset = utils.load_datasets.DeepSig2018Dataset(dataset_path)
 
-    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                               'BPSK']
-    train_SNRs = np.arange(-20, 19, 2)
-    test_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                               'BPSK']
-    test_SNRs = np.arange(-20, 19, 2)
-    dataset_train_name = '2016.10A'
-    dataset_test_name = '2016.10A'
-    dataDir = '/home/trey/experiment_rfdiffusion/models/test/'
-    utils.training.create_directory(dataDir)
-    split = [0.75, 0.05, 0.20]
-    train_transforms = transforms.Compose([
-        net_transforms.PowerNormalization(),
-    ])
-    test_transforms = train_transforms
-    train_dataset = utils.load_datasets.getDataset(dataset_train_name, dataset_test_name,
-                                                                                train_modulations, train_SNRs,
-                                                                                test_modulations, test_SNRs, split,
-                                                                                dataDir, train_transforms, test_transforms)
     
     trainer = Trainer1D(
         diffusion,

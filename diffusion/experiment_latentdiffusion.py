@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 from torch.optim import Adam
 from torch.utils.data import DataLoader
-from audio_encoders_pytorch.audio_encoders_pytorch import AutoEncoder1d, TanhBottleneck
-from audio_diffusion_pytorch.audio_diffusion_pytorch import DiffusionModel, UNetV0, VDiffusion, VSampler
+from audio_encoders_pytorch import AutoEncoder1d, TanhBottleneck, NoiserBottleneck
+from audio_diffusion_pytorch import DiffusionModel, UNetV0, VDiffusion, VSampler
 import utils.load_datasets
 import os
 from tqdm import tqdm
@@ -44,6 +44,52 @@ def setup_autoencoder(config):
         autoencoder.load_state_dict(checkpoint['model_state_dict'])
 
     return autoencoder
+
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.relu(x)
+        x = self.fc2(x)
+
+class ContrastiveModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        if config['ae_bottleneck'] == 0:
+            bottleneck = [TanhBottleneck()]
+        elif config['ae_bottleneck'] == 1:
+            bottleneck = [TanhBottleneck(), NoiserBottleneck(config['ae_sigma'])]
+        elif config['ae_bottleneck'] == 2:
+            bottleneck = [NoiserBottleneck(config['ae_sigma']), TanhBottleneck()]
+        self.signal_encoder = AutoEncoder1d(
+            in_channels=config['ae_in_channels'],
+            channels=config['ae_channels'],
+            multipliers=config['ae_multipliers'],
+            factors=config['ae_factors'],
+            num_blocks=config['ae_num_blocks'],
+            patch_size=config['ae_patch_size'],
+            resnet_groups=config['ae_resnet_groups'],
+            bottleneck=bottleneck)
+
+        # Load pretrained weights if a path is provided
+        self.text_encoder = BertModel.from_pretrained('bert-base-uncased')
+        self.text_projection_head = nn.Linear(768, config['mlp_projection_dim'])
+        self.signal_projection_head = nn.Linear(64 * 256,  config['mlp_projection_dim'])
+        self.temperature = nn.Parameter(torch.ones([])*np.log(1/0.07))
+    def forward(self, signal, text):
+        signal_embedding = self.signal_encoder.encode(signal)
+        # Reshape and project signal embedding
+        signal_embedding = signal_embedding.view(signal_embedding.size(0), -1)  # Shape: [512, 8192]
+        signal_embedding = self.signal_projection_head(signal_embedding)  # Shape: [512, 768]
+
+        text_outputs = self.text_encoder(**text)
+        text_embedding = self.text_projection_head(text_outputs.last_hidden_state[:, 0, :])
+        return signal_embedding, text_embedding, self.temperature.exp()
 
 def setup_diffusion_model(config):
     return DiffusionModel(
@@ -148,7 +194,8 @@ def main():
     os.makedirs(config['model_save_dir'], exist_ok=True)
 
     accelerator, run_name = setup_accelerator(config)
-
+    embedding_model = torch.load(checkpoint_path, map_location='cpu')
+    embedder = embedding_model.text_encoder()
     ae = setup_autoencoder(config)
     model = setup_diffusion_model(config)
     optimizer = setup_training(config, model)

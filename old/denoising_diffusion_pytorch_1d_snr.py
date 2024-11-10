@@ -22,10 +22,6 @@ from ema_pytorch import EMA
 from tqdm.auto import tqdm
 
 import utils.load_datasets
-import utils.training
-import utils.logging
-from networks import *
-import networks.transforms as net_transforms
 from torchvision import transforms
 import numpy as np
 
@@ -206,8 +202,8 @@ class ResnetBlock(Module):
 
         scale_shift = None
         if exists(self.mlp) and exists(time_emb) or exists(class_emb) or exists(snr_emb):
-            #time_emb = self.mlp(time_emb)
-            #time_emb = rearrange(time_emb, 'b c -> b c 1')
+            time_emb = self.mlp(time_emb)
+            time_emb = rearrange(time_emb, 'b c -> b c 1')
             cond_emb = tuple(filter(exists, (time_emb, class_emb, snr_emb)))
             print(time_emb.size())
             print(class_emb.size())
@@ -937,9 +933,10 @@ class Trainer1D(object):
                 for _ in range(self.gradient_accumulate_every):
                     x, mod_class, snr = next(self.dl)
                     x = x.to(device)
-                    #print(x.size())
                     mod_class = mod_class.to(device)
                     snr = snr.to(device)
+                    print(mod_class)
+                    print(snr)
 
                     with self.accelerator.autocast():
                         loss = self.model(x, classes=mod_class, snrs=snr)
@@ -980,44 +977,30 @@ class Trainer1D(object):
         accelerator.print('training complete')
 
 if __name__ == '__main__':
-    sequence_len = 128
+    sequence_len = 1024
     timestep = 5
-    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                         'BPSK']
-    train_SNRs = np.arange(-20, 19, 2)
+
+    train_modulations = ['OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK', '16APSK', '32APSK',
+                        '64APSK', '128APSK', '16QAM', '32QAM', '64QAM', '128QAM', '256QAM', 'AM-SSB-WC',
+                        'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC', 'FM', 'GMSK', 'OQPSK']
+    train_SNRs = np.arange(-30,2,30)
+    print(train_SNRs)
     model = Unet1D(
         dim = 64,
-        num_classes= len(train_modulations),
-        num_snrs = len(train_SNRs),
         channels = 2,
-        dim_mults = (1, 2, 4, 8)
+        dim_mults = (1, 2, 4, 8),
+        num_classes= len(train_modulations),
+        num_snrs = len(train_SNRs)
     )
-    print(model)
+
     diffusion = GaussianDiffusion1D(
         model,
         seq_length = sequence_len,
         timesteps = timestep
     ).cuda()
+    dataset_path = "/ext/trey/experiment_diffusion/experiment_rfdiffusion/dataset/GOLD_XYZ_OSC.0001_1024.hdf5"
+    train_dataset = utils.load_datasets.DeepSig2018Dataset_MOD(dataset_path)
 
-    train_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                               'BPSK']
-    train_SNRs = np.arange(-20, 19, 2)
-    test_modulations = ['AM-SSB', 'CPFSK', 'QPSK', 'GFSK', 'PAM4', 'QAM16', 'WBFM', '8PSK', 'QAM64', 'AM-DSB',
-                               'BPSK']
-    test_SNRs = np.arange(-20, 19, 2)
-    dataset_train_name = '2016.10A'
-    dataset_test_name = '2016.10A'
-    dataDir = '/home/trey/experiment_rfdiffusion/models/test/'
-    utils.training.create_directory(dataDir)
-    split = [0.75, 0.05, 0.20]
-    train_transforms = transforms.Compose([
-        net_transforms.PowerNormalization(),
-    ])
-    test_transforms = train_transforms
-    train_dataset, valid_dataset, test_dataset = utils.load_datasets.getDataset(dataset_train_name, dataset_test_name,
-                                                                                train_modulations, train_SNRs,
-                                                                                test_modulations, test_SNRs, split,
-                                                                                dataDir, train_transforms, test_transforms)
     
     trainer = Trainer1D(
         diffusion,
@@ -1026,5 +1009,3 @@ if __name__ == '__main__':
     )
 
     trainer.train()
-
-

@@ -23,83 +23,125 @@ from transformers import BertModel, BertTokenizer, RobertaModel, RobertaTokenize
 
 os.environ["WANDB_AGENT_DISABLE_FLAPPING"] = "true"
 import wandb
-def plot_latent_space(latent_representations, labels, idx=0, save_dir="plots", save_name="latent_space"):
-    """
-    Plot the latent space of the encoded signals using different methods.
-
-    Parameters:
-    - latent_representations: The encoded latent representations.
-    - idx: Index for distinguishing multiple plots if needed.
-    """
-    latent_representations = latent_representations.cpu().detach().numpy()
-    # Flatten latent representations if necessary
-    if latent_representations.ndim > 2:
-        num_samples = latent_representations.shape[0]
-        num_features = np.prod(latent_representations.shape[1:])
-        latent_representations = latent_representations.reshape(num_samples, num_features)
-
-    os.makedirs(save_dir, exist_ok=True)
-
-    # Create a color map for unique labels
-    unique_labels = list(set(labels))
-    color_map = plt.cm.get_cmap('tab20')  # You can change 'tab20' to any other colormap
-    color_dict = {label: color_map(i / len(unique_labels)) for i, label in enumerate(unique_labels)}
-
-    # Create a 2D histogram (heatmap) from the latent space data
-    plt.figure(figsize=(10, 8))
-    heatmap, xedges, yedges = np.histogram2d(latent_representations[:, 0], latent_representations[:, 1], bins=50,
-                                             range=[[-1, 1], [-1, 1]])
-
-    # Plot heatmap
-    sns.heatmap(heatmap.T, cmap='viridis', cbar=True, xticklabels=50, yticklabels=50)
-
-    plt.title('Latent Space Heatmap')
-    plt.xlabel('Latent Dimension 1')
-    plt.ylabel('Latent Dimension 2')
-    plt.savefig(os.path.join(save_dir, f"{save_name}_heatmap_{idx}.jpg"), format="jpg")
-    plt.close()
-
-    max_samples = 10000  # Adjust this based on memory constraints
-    if latent_representations.shape[0] > max_samples:
-        indices = np.random.choice(latent_representations.shape[0], max_samples, replace=False)
-        latent_representations = latent_representations[indices]
-        labels = [labels[i] for i in indices]
-
-    pca_result = PCA(n_components=2).fit_transform(latent_representations)
-    tsne_result = TSNE(n_components=2, random_state=42).fit_transform(latent_representations)
-
-    # Plot configurations
-    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-    # Function to create scatter plot with unique colors
-    def scatter_with_legend(ax, x, y, labels, title):
-        for label in unique_labels:
-            mask = np.array(labels) == label
-            ax.scatter(x[mask], y[mask], c=[color_dict[label]], label=label, alpha=0.7)
-        ax.set_title(title)
-        ax.set_xlabel('Dimension 1')
-        ax.set_ylabel('Dimension 2')
-        ax.grid(True)
-        ax.legend(title="Labels", bbox_to_anchor=(1.05, 1), loc='upper left')
-
-    # Simple plot (first two dimensions)
-    scatter_with_legend(axes[0], latent_representations[:, 0], latent_representations[:, 1], labels,
-                        f'Latent Space - Simple (Pair {idx + 1})')
-
-    # PCA plot
-    scatter_with_legend(axes[1], pca_result[:, 0], pca_result[:, 1], labels,
-                        f'Latent Space - PCA (Pair {idx + 1})')
-
-    # t-SNE plot
-    scatter_with_legend(axes[2], tsne_result[:, 0], tsne_result[:, 1], labels,
-                        f'Latent Space - t-SNE (Pair {idx + 1})')
-
-    plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, f"{save_name}_{idx}.jpg"), format="jpg", bbox_inches='tight')
-    plt.close()
 
 
 
-def plot_waveform_and_spectrogram(input_signal, decoded_signal, idx, save_dir="plots",
+def plot_latent_space(latent_representations, labels, idx=0, save_dir="plots_fixed", save_name="latent_space",
+                          max_samples=10000):
+        """
+        Plot the latent space of the encoded signals using t-SNE, with different subplots for specific modulation groups.
+        Limit the number of samples to speed up t-SNE computation.
+        """
+        latent_representations = latent_representations.cpu().detach().numpy()
+        if latent_representations.ndim > 2:
+            num_samples = latent_representations.shape[0]
+            num_features = np.prod(latent_representations.shape[1:])
+            latent_representations = latent_representations.reshape(num_samples, num_features)
+
+        os.makedirs(save_dir, exist_ok=True)
+
+        # Limit the number of samples
+        if latent_representations.shape[0] > max_samples:
+            indices = np.random.choice(latent_representations.shape[0], max_samples, replace=False)
+            latent_representations = latent_representations[indices]
+            labels = [labels[i] for i in indices]
+
+        # Define modulation groups
+        analog_mods = ['AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC', 'FM']
+        digital_mods = ['OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK', '16APSK', '32APSK',
+                        '64APSK', '128APSK', '16QAM', '32QAM', '64QAM', '128QAM', '256QAM', 'GMSK', 'OQPSK']
+        am_mods = ['AM-SSB-WC', 'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC']
+        fm_mods = ['FM']
+        ask_mods = ['OOK', '4ASK', '8ASK']
+        psk_mods = ['BPSK', 'QPSK', '8PSK', '16PSK', '32PSK', '16APSK', '32APSK', '64APSK', '128APSK']
+        qam_mods = ['16QAM', '32QAM', '64QAM', '128QAM', '256QAM']
+
+        # Perform t-SNE
+        print(f"Performing t-SNE on {latent_representations.shape[0]} samples...")
+        tsne_result = TSNE(n_components=2, random_state=42, n_jobs=-1).fit_transform(latent_representations)
+        print("t-SNE complete.")
+
+        # Create color map
+        unique_labels = sorted(set(labels))
+        color_map = plt.cm.get_cmap('tab20')
+        color_dict = {label: color_map(i / len(unique_labels)) for i, label in enumerate(unique_labels)}
+
+        # Function to create scatter plot
+        def scatter_with_legend(ax, x, y, plot_labels, title, mod_group):
+            for label in mod_group:
+                mask = np.array(plot_labels) == label
+                if np.any(mask):  # Only plot if there are points for this label
+                    ax.scatter(x[mask], y[mask], c=[color_dict[label]], label=label, alpha=0.7)
+            ax.set_title(title)
+            ax.set_xlabel('t-SNE 1')
+            ax.set_ylabel('t-SNE 2')
+            ax.legend(title="Modulations", bbox_to_anchor=(1.05, 1), loc='upper left')
+
+        # Create subplots
+        fig, axes = plt.subplots(2, 2, figsize=(20, 20))
+
+        # Analog vs Digital
+        scatter_with_legend(axes[0, 0], tsne_result[:, 0], tsne_result[:, 1], labels, 'Analog Modulations', analog_mods)
+        scatter_with_legend(axes[0, 1], tsne_result[:, 0], tsne_result[:, 1], labels, 'Digital Modulations',
+                            digital_mods)
+
+        # AM vs FM
+        scatter_with_legend(axes[1, 0], tsne_result[:, 0], tsne_result[:, 1], labels, 'AM Modulations', am_mods)
+        scatter_with_legend(axes[1, 1], tsne_result[:, 0], tsne_result[:, 1], labels, 'FM Modulation', fm_mods)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"{save_name}_analog_digital_{idx}.jpg"), format="jpg", bbox_inches='tight')
+        plt.close()
+
+        # ASK vs PSK vs QAM
+        fig, axes = plt.subplots(1, 3, figsize=(30, 10))
+
+        scatter_with_legend(axes[0], tsne_result[:, 0], tsne_result[:, 1], labels, 'ASK Modulations', ask_mods)
+        scatter_with_legend(axes[1], tsne_result[:, 0], tsne_result[:, 1], labels, 'PSK Modulations', psk_mods)
+        scatter_with_legend(axes[2], tsne_result[:, 0], tsne_result[:, 1], labels, 'QAM Modulations', qam_mods)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, f"{save_name}_ask_psk_qam_{idx}.jpg"), format="jpg", bbox_inches='tight')
+        plt.close()
+
+        def plot_grouped_scatter(grouped_labels, group_names, title, filename):
+            fig, ax = plt.subplots(figsize=(15, 15))
+            color_map = plt.cm.get_cmap('tab10')
+            color_dict = {group: color_map(i) for i, group in enumerate(group_names) if group != 'Other'}
+
+            for group in group_names:
+                if group != 'Other':  # Exclude 'Other' category
+                    mask = np.array(grouped_labels) == group
+                    if np.any(mask):
+                        ax.scatter(tsne_result[mask, 0], tsne_result[mask, 1], c=[color_dict[group]], label=group,
+                                   alpha=0.7)
+
+            ax.set_title(title)
+            ax.set_xlabel('t-SNE 1')
+            ax.set_ylabel('t-SNE 2')
+            ax.legend(title="Modulations", bbox_to_anchor=(1.05, 1), loc='upper left')
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{save_name}_{filename}_{idx}.jpg"), format="jpg", bbox_inches='tight')
+            plt.close()
+
+        # 1. Digital vs. Analog (grouped)
+
+        digital_analog_labels = ['Digital' if label in digital_mods else 'Analog' for label in labels]
+        plot_grouped_scatter(digital_analog_labels, ['Digital', 'Analog'], 'Digital vs Analog Modulations',
+                             'digital_vs_analog')
+
+        # 2. AM vs. FM (grouped)
+        am_fm_labels = ['AM' if label in am_mods else 'FM' if label in fm_mods else 'Other' for label in labels]
+        plot_grouped_scatter(am_fm_labels, ['AM', 'FM'], 'AM vs FM Modulations', 'am_vs_fm')
+
+        # 3. ASK vs. PSK vs. QAM (grouped)
+        ask_psk_qam_labels = ['ASK' if label in ask_mods else 'PSK' if label in psk_mods
+        else 'QAM' if label in qam_mods else 'Other' for label in labels]
+        plot_grouped_scatter(ask_psk_qam_labels, ['ASK', 'PSK', 'QAM'], 'ASK vs PSK vs QAM Modulations',
+                             'ask_psk_qam')
+
+
+def plot_waveform_and_spectrogram(input_signal, decoded_signal, idx, save_dir="plots_fixed",
                                   save_name="waveform_spectrogram"):
     """
     Plot the waveform and spectrogram of the input and decoded signals.
@@ -218,6 +260,7 @@ def evaluate_model(model, data_loader, accelerator):
         for batch_idx, (x, labels) in enumerate(data_loader):
             x = x.to(accelerator.device)
             y = model.encode(x)
+            print(y.size())
             y_decoded = model.decode(y)
             # labels = labels.to(accelerator.device)  # Assuming labels are provided
 
@@ -260,9 +303,6 @@ def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader
 
     model.train()
     step = 1
-    best_val_loss = float('inf')
-    patience = 0
-    early_stopping_patience = config['early_stopping_patience']
 
     for epoch in range(config['epochs']):
         for x, _ in train_loader:
@@ -275,23 +315,10 @@ def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader
             optimizer.zero_grad()
 
             progress_bar.update(1)
-
             accelerator.log({"training_loss": loss, "learning_rate": scheduler.get_last_lr()[0]}, step=step)
             step += 1
-        eval_loss, freq_loss = evaluate_model(model, val_loader, accelerator)
-        if epoch % config['save_every'] == 0 and accelerator.is_main_process:
-            save_checkpoint(model, optimizer, epoch, config['model_save_dir'], f'model_epoch_{epoch}.pth')
-
-        if eval_loss < best_val_loss:
-            best_val_loss = eval_loss
-            patience = 0
-            if accelerator.is_main_process:
-                save_checkpoint(model, optimizer, epoch, config['model_save_dir'], f'model_epoch_{epoch}.pth')
-        else:
-            patience += 1
-            if patience >= early_stopping_patience:
-                print(f"Early stopping triggered at epoch {epoch}")
-                break
+        if epoch == 5:
+            eval_loss, freq_loss = evaluate_model(model, val_loader, accelerator)
         if epoch % config['save_every'] == 0 and accelerator.is_main_process:
             save_checkpoint(model, optimizer, epoch, config['model_save_dir'], f'model_epoch_{epoch}.pth')
 
@@ -300,27 +327,22 @@ def train_model(model, optimizer, criterion, scheduler, train_loader, val_loader
 
 def save_checkpoint(model, optimizer, epoch, save_dir, filename):
     checkpoint_path = os.path.join(save_dir, filename)
-    torch.save(model, checkpoint_path)
+    torch.save(model.state_dict(), checkpoint_path)
 
 
 def main():
-    # Load the sweep configuration
-    sweep_config = json.load(open('autoencoder_sweep.json'))
+    # Load the configuration from a single JSON file
+    with open('config_autoencoder.json', 'r') as f:
+        config = json.load(f)
 
-    # Load the fixed parameters from the separate JSON file
-    with open('autoencoder_sweep_fixed.json', 'r') as f:
-        fixed_params = json.load(f)
-
-    # Initialize the wandb sweep
-    print(f"Initializing wandb with project name: {fixed_params['project_name']}")
-    # Initialize the wandb sweep
-    wandb.init(config={**sweep_config["parameters"], **fixed_params})
-    config = wandb.config
+    # Initialize wandb
+    print(f"Initializing wandb with project name: {config['project_name']}")
+    wandb.init(project=config['project_name'], config=config)
 
     # Construct model_save_dir
     config['model_save_dir'] = os.path.join(config['base_save_dir'], config['project_name'])
     os.makedirs(config['model_save_dir'], exist_ok=True)
-    # Choose tokenizer based on the text encoder type
+
     accelerator, run_name = setup_accelerator(config)
 
     model = setup_model(config)

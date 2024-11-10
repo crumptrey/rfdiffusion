@@ -14,6 +14,27 @@ from os.path import dirname, join as pjoin
 import scipy.io as sio
 import matplotlib.pyplot as plt
 import h5py
+class PowerNormalization(torch.nn.Module):
+    def __init__(self):
+        super(PowerNormalization, self).__init__()
+
+    def forward(self, signals):
+        """
+        Perform L2 normalization on a signal array of shape (batch_size, 2, N).
+
+        Parameters:
+            signals (torch.Tensor): 3D tensor of shape (batch_size, 2, N).
+
+        Returns:
+            torch.Tensor: Normalized signals with each row normalized to have a unit Euclidean norm.
+        """
+        # Compute the L2 norm along the second dimension (dim=1).
+        norms = torch.norm(signals, p=2, dim=1, keepdim=True)
+        
+        # Perform L2 normalization with broadcasting.
+        normalized_signals = signals / norms
+
+        return normalized_signals
 
 def plot_class_distribution(dataset, dataset_name, directory):
     modulations = [item[1] for item in dataset]
@@ -114,35 +135,36 @@ def balanced_split(data, test_data, split, train_modulations, train_SNRs, TRAIN_
                     subsublist]
     return train_dataset, valid_dataset, test_dataset
 
-
 class SignalDataset(Dataset):
-    def __init__(self, hdf5_directory, transform = None):
-        self.hdf5_files = [os.path.join(hdf5_directory, file) for file in os.listdir(hdf5_directory) if file.endswith('.h5')]
-        self.data_indices = []
+    def __init__(self, hdf5_file, transform):
+        # Open the HDF5 file
+        self.modulationType = ["BPSK", "QPSK", "8PSK", "16QAM", "64QAM"]
+        self.hdf5_file = hdf5_file
+        with h5py.File(hdf5_file, 'r') as hdf:
+            # Load datasets
+            self.X = hdf['/X'][:]  # Shape: [2, 1024, total_samples]
+            self.modulation_classes = hdf['/mod'][:]  # Shape: [total_samples]
+            self.snr_levels = hdf['/snr'][:]  # Shape: [total_samples]
         self.transform = transform
-        self._create_index()
-
-    def _create_index(self):
-        for file_idx, file in enumerate(self.hdf5_files):
-            with h5py.File(file, 'r') as f:
-                num_signals = f['/rxSignals/real'].shape[1]  # Should be 500
-                self.data_indices.extend([(file_idx, i) for i in range(num_signals)])
 
     def __len__(self):
-        return len(self.data_indices)
+        # Return the number of samples
+        return self.X.shape[0]  # Total samples
 
-    def __getitem__(self, idx):
-        file_idx, signal_idx = self.data_indices[idx]
-        with h5py.File(self.hdf5_files[file_idx], 'r') as f:
-            real_part = f['/rxSignals/real'][:, signal_idx]
-            imag_part = f['/rxSignals/imag'][:, signal_idx]
-            signal = np.stack((real_part, imag_part), axis=0)
-            signal = torch.from_numpy(signal).float()
-            
-            prompt = str(f['/prompts'][0, signal_idx].decode('utf-8'))  # Decode bytes to string
-            if self.transform:
-                signal = self.transform(signal)
-        
+    def __getitem__(self, index):
+        # Get the signal and its corresponding modulation class and SNR level
+        signal = self.X[index]  # Shape: [2, 1024]
+        mod_class = self.modulation_classes[:,index]  # Get modulation class
+        snr_level = self.snr_levels[:,index]  # Get SNR level
+        mod_type = int(mod_class) - 1
+        mod_type = self.modulationType[mod_type]
+        snr_level = int(snr_level)
+        prompt = '{0} modulated signal at {1} dB SNR'.format(mod_type, snr_level)
+        signal = torch.from_numpy(signal)
+        signal = signal.permute(1,0)
+        signal = signal.float()
+        if self.transform:
+            signal = self.transform(signal)
         return signal, prompt
 
 def getDataset(train_name, test_name, train_modulations, train_SNRs, test_modulations, test_SNRs, split, directory,
@@ -338,7 +360,8 @@ class DeepSig2016Dataset(Dataset):
         if self.transform:
             x = self.transform(x)
         #x = torch.permute(x, [1, 0])
-        return x, mod_type, snr
+        prompt = '{0} modulated signal at {1} dB SNR'.format(mod_type, snr)
+        return x, prompt
 
 
 class DeepSig2018Dataset(Dataset):
@@ -346,12 +369,22 @@ class DeepSig2018Dataset(Dataset):
         self.file_dir = file_dir
         self.transform = transform
         hdf5_file = h5py.File(self.file_dir, 'r')
-        self.X = hdf5_file['X']
-        self.Y = np.argmax(hdf5_file['Y'], axis=1)
-        self.Z = hdf5_file['Z'][:, 0]
+        #self.X = hdf5_file['X']
+        #self.Y = np.argmax(hdf5_file['Y'], axis=1)
+        #self.Z = hdf5_file['Z'][:, 0]
         self.TRAIN_MOD_TYPES = ['OOK', '4ASK', '8ASK', 'BPSK', 'QPSK', '8PSK', '16PSK', '32PSK', '16APSK', '32APSK',
                                '64APSK', '128APSK', '16QAM', '32QAM', '64QAM', '128QAM', '256QAM', 'AM-SSB-WC',
                                'AM-SSB-SC', 'AM-DSB-WC', 'AM-DSB-SC', 'FM', 'GMSK', 'OQPSK']
+        Z = hdf5_file['Z'][:, 0]
+        snr_min = 0
+        if snr_min is not None:
+            indices = np.where((Z >= snr_min))[0]
+        else:
+            indices = np.arange(len(Z))
+        self.X = hdf5_file['X'][indices]
+        self.Y = np.argmax(hdf5_file['Y'][indices], axis=1)
+        self.Z = Z[indices]
+        Z = Z[indices]
 
     def __len__(self):
         return len(self.X)
@@ -364,8 +397,7 @@ class DeepSig2018Dataset(Dataset):
         x = torch.permute(x, [1, 0])
         y = self.TRAIN_MOD_TYPES[y]
         #prompt = '{0} modulated signal at {1} dB SNR'.format(y,z)
-
-        prompt = '{0} modulated signal'.format(y)
+        prompt = '{0} modulated signal at {1} dB SNR'.format(y, z)
         return x, prompt
 
 class DeepSig2018Dataset_MOD(Dataset):

@@ -7,11 +7,8 @@
   },
   "parameters": {
     "batch_size" : {
-      "values" : [128, 256, 512, 1024]
+      "values" : [128, 256, 512]
     },
-    "project_name": {
-            "value": "my_project"
-        },
     "signal_mlp_hidden_dim": {
       "values": [64, 128, 256, 512, 1024]
     },
@@ -22,7 +19,8 @@
       "values": [128, 256, 512, 768, 1024]
     },
     "learning_rate": {
-      "values": [1e-4, 5e-4, 1e-3]
+      "min":1e-6
+      "max":0.1
     },
     "weight_decay": {
       "values": [0.0, 1e-4, 1e-3]
