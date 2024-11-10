@@ -1,0 +1,18 @@
+{
+    "project_name": "rf_transformer",
+    "base_save_dir": "/ext/trey/experiment_diffusion/experiment_rfdiffusion/models",
+    "learning_rate": 1e-4,
+    "epochs": 100,
+    "batch_size": 256,
+    "adam_betas": [0.9, 0.999],
+    "d_model": 16,
+    "nhead": 8,
+    "num_encoder_layers": 6,
+    "dim_feedforward": 2048,
+    "dropout": 0.1,
+    "dataset_path": "/ext/trey/experiment_diffusion/experiment_rfdiffusion/dataset/GOLD_XYZ_OSC.0001_1024.hdf5",
+    "dataset_name": "DeepSig2018Dataset",
+    "num_workers": 8,
+    "save_every": 10,
+    "weight_decay": 1e-3
+}
